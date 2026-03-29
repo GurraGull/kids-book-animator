@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 from PIL import Image, ImageDraw
-from pipeline.prepare import normalize_image, prepare_book_images
+from pipeline.prepare import normalize_image, prepare_book_images, extract_pdf_pages
 
 
 def make_test_image(path, size=(800, 600), color=(255, 255, 255)):
@@ -38,3 +38,21 @@ def test_prepare_book_images_creates_normalized_dir(tmp_path):
     assert normalized_dir.exists()
     assert len(list(normalized_dir.glob("*.jpg"))) == 2
     assert result == [str(normalized_dir / "page01.jpg"), str(normalized_dir / "page02.jpg")]
+
+
+def test_prepare_book_images_raises_without_pages_or_pdf(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        prepare_book_images(str(tmp_path))
+
+
+def test_extract_pdf_pages_requires_pdf2image(tmp_path, monkeypatch):
+    """extract_pdf_pages raises ImportError if pdf2image not installed."""
+    import builtins
+    real_import = builtins.__import__
+    def mock_import(name, *args, **kwargs):
+        if name == "pdf2image":
+            raise ImportError("No module named 'pdf2image'")
+        return real_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+    with pytest.raises(ImportError, match="pdf2image"):
+        extract_pdf_pages("/fake/book.pdf", str(tmp_path))

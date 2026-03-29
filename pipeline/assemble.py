@@ -171,23 +171,25 @@ def make_title_clip(cover_image: str, title: str, audio_path: str, output_path: 
 
 
 def make_closing_clip(output_path: str, duration: float = 2.5) -> str:
-    """Create 'The End' closing card on a dark background."""
+    """Create 'The End' closing card on a dark background, with silent audio."""
     img = Image.new("RGB", (FRAME_W, FRAME_H), (26, 10, 46))
     img = _draw_text_on_image(img, "The End", FONT_SIZE_CLOSING, y_frac=0.5)
 
     with tempfile.TemporaryDirectory() as tmp:
         closing_img = str(Path(tmp) / "closing.jpg")
         img.save(closing_img, "JPEG", quality=92)
+        video = ffmpeg.input(closing_img, loop=1, t=duration + 0.3, framerate=24)
+        silent = ffmpeg.input("anullsrc=r=44100:cl=stereo", f="lavfi", t=duration)
         (
             ffmpeg
-            .input(closing_img, loop=1, t=duration + 0.3, framerate=24)
             .output(
+                video, silent,
                 output_path,
                 vf=f"scale={FRAME_W}:{FRAME_H}",
                 vcodec="libx264",
+                acodec="aac",
                 pix_fmt="yuv420p",
                 t=duration,
-                an=None,
             )
             .overwrite_output()
             .run(quiet=True)
@@ -195,20 +197,57 @@ def make_closing_clip(output_path: str, duration: float = 2.5) -> str:
     return output_path
 
 
-def concatenate_clips(clip_paths: list, music_path, output_path: str) -> str:
-    """Concatenate clips using ffmpeg concat demuxer. Optionally mix in background music."""
-    clips_file = Path(output_path).parent / "clips.txt"
-    clips_file.write_text("\n".join(f"file '{p}'" for p in clip_paths))
+def _apply_crossfades(clip_paths: list, output_path: str, fade_duration: float = 0.5) -> str:
+    """
+    Join clips with xfade crossfade transitions.
+    Each clip must have a video stream. Audio is handled separately (merged after).
+    """
+    if len(clip_paths) == 1:
+        # Nothing to crossfade — just copy
+        (
+            ffmpeg.input(clip_paths[0])
+            .output(output_path, c="copy")
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        return output_path
 
-    concat_path = output_path if not music_path else str(Path(output_path).with_suffix(".nomusic.mp4"))
+    # Get durations to calculate xfade offsets
+    durations = [float(ffmpeg.probe(p)["format"]["duration"]) for p in clip_paths]
+
+    # Build complex filter: chain xfade across all clips
+    inputs = [ffmpeg.input(p) for p in clip_paths]
+    video_streams = [inp.video for inp in inputs]
+    audio_streams = [inp.audio for inp in inputs]
+
+    # Chain video xfades
+    offset = durations[0] - fade_duration
+    v = video_streams[0]
+    for i in range(1, len(clip_paths)):
+        v = ffmpeg.filter([v, video_streams[i]], "xfade",
+                          transition="fade",
+                          duration=fade_duration,
+                          offset=max(0.0, offset))
+        offset += durations[i] - fade_duration
+
+    # Concatenate audio streams (no crossfade on audio — keeps sync simple)
+    audio_concat = ffmpeg.filter(audio_streams, "concat", n=len(audio_streams), v=0, a=1)
 
     (
         ffmpeg
-        .input(str(clips_file), format="concat", safe=0)
-        .output(concat_path, c="copy")
+        .output(v, audio_concat, output_path, vcodec="libx264", acodec="aac", pix_fmt="yuv420p")
         .overwrite_output()
         .run(quiet=True)
     )
+    return output_path
+
+
+def concatenate_clips(clip_paths: list, music_path, output_path: str) -> str:
+    """Concatenate clips with crossfade transitions. Optionally mix in background music."""
+    concat_path = output_path if not music_path else str(Path(output_path).with_suffix(".nomusic.mp4"))
+
+    print("  Applying crossfade transitions...")
+    _apply_crossfades(clip_paths, concat_path)
 
     if music_path:
         probe = ffmpeg.probe(concat_path)
@@ -237,7 +276,6 @@ def concatenate_clips(clip_paths: list, music_path, output_path: str) -> str:
         )
         Path(concat_path).unlink(missing_ok=True)
 
-    clips_file.unlink(missing_ok=True)
     return output_path
 
 
