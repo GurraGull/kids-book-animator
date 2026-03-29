@@ -39,19 +39,19 @@ def _get_font(size: int):
 
 def _draw_text_on_image(img: Image.Image, text: str, font_size: int,
                          y_frac: float = 0.82, color=(255, 255, 255)) -> Image.Image:
-    """Burn text onto an image with drop shadow. Returns modified copy."""
-    out = img.copy()
-    draw = ImageDraw.Draw(out)
+    """Burn text onto an image with a semi-transparent bar and drop shadow."""
+    out = img.copy().convert("RGBA")
     font = _get_font(font_size)
     w, h = out.size
 
     # Wrap text to 80% of frame width
+    dummy_draw = ImageDraw.Draw(out)
     words = text.split()
     lines = []
     current = []
     for word in words:
         test_line = " ".join(current + [word])
-        bbox = draw.textbbox((0, 0), test_line, font=font)
+        bbox = dummy_draw.textbbox((0, 0), test_line, font=font)
         if bbox[2] - bbox[0] > w * 0.8 and current:
             lines.append(" ".join(current))
             current = [word]
@@ -60,21 +60,32 @@ def _draw_text_on_image(img: Image.Image, text: str, font_size: int,
     if current:
         lines.append(" ".join(current))
 
-    line_height = font_size + 8
+    line_height = font_size + 10
+    pad = 18
     total_text_h = line_height * len(lines)
-    y_start = int(h * y_frac) - total_text_h // 2
+    bar_h = total_text_h + pad * 2
+    bar_top = int(h * y_frac) - bar_h // 2
 
+    # Draw semi-transparent dark bar
+    overlay = Image.new("RGBA", out.size, (0, 0, 0, 0))
+    bar_draw = ImageDraw.Draw(overlay)
+    bar_draw.rectangle([(0, bar_top), (w, bar_top + bar_h)], fill=(0, 0, 0, 160))
+    out = Image.alpha_composite(out, overlay)
+
+    # Draw text on top
+    draw = ImageDraw.Draw(out)
+    y_start = bar_top + pad
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
         text_w = bbox[2] - bbox[0]
         x = (w - text_w) // 2
         y = y_start + i * line_height
-        # Shadow
-        for dx, dy in [(3, 3), (-2, 2), (2, -2), (-2, -2)]:
-            draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 200))
+        # Drop shadow
+        for dx, dy in [(3, 3), (-2, 2), (2, -2)]:
+            draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 220))
         draw.text((x, y), line, font=font, fill=color)
 
-    return out
+    return out.convert("RGB")
 
 
 def build_subtitle_filter(text: str, width: int, height: int) -> str:
