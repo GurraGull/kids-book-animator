@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+books/*/audio/
+books/*/normalized/
+books/*/clips/
+books/*/plan.json
+books/*.mp4
+books/**/*.mp4
+*.mp4
