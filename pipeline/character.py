@@ -1,72 +1,108 @@
 import os
-import yaml
+import time
+import base64
 import tempfile
-import shutil
+import urllib.request
 from pathlib import Path
-import rembg
 
-# Map our action names to AnimatedDrawings motion config names
-ACTION_TO_MOTION = {
-    "walk": "walks_in_place",
-    "wave": "wave_hello",
-    "jump": "jumping",
-    "dance": "dab",
-    "sit": "walks_in_place",  # fallback — sitting not supported
+# Motion prompt templates — these get combined with the scene description
+# Runway responds best to specific, cinematic language about what moves and how
+ACTION_TO_PROMPT = {
+    "walk":    "Make the character in the picture walk.",
+    "wave":    "Make the character in the picture wave their hand.",
+    "jump":    "Make the character in the picture jump.",
+    "dance":   "Make the character in the picture dance.",
+    "sit":     "Make the character in the picture move their body gently.",
+    "balance": "Make the character in the picture move their body and arms for balance.",
+    "run":     "Make the character in the picture run.",
 }
 
-
-def remove_background(src_path: str, dst_path: str) -> str:
-    """Remove background from image using rembg. Returns dst_path."""
-    with open(src_path, "rb") as f:
-        input_data = f.read()
-    output_data = rembg.remove(input_data)
-    with open(dst_path, "wb") as f:
-        f.write(output_data)
-    return dst_path
+RUNWAY_MODEL = "gen4_turbo"
+VIDEO_DURATION = 5  # seconds — gen4_turbo minimum is 5s
 
 
-def animate_character(
+def _image_to_data_uri(image_path: str) -> str:
+    """Convert a local image to a base64 data URI for Runway API."""
+    with open(image_path, "rb") as f:
+        data = f.read()
+    ext = Path(image_path).suffix.lower().lstrip(".")
+    mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def animate_with_runway(
     image_path: str,
     action: str,
-    duration_seconds: float,
+    description: str,
     output_path: str,
+    raw_prompt: bool = False,
 ) -> str:
     """
-    Animate a character image using Meta AnimatedDrawings.
-    Returns path to output MP4 clip.
-    Requires AnimatedDrawings to be installed:
-        git clone https://github.com/facebookresearch/AnimatedDrawings.git
-        cd AnimatedDrawings && pip install -e .
+    Animate a book page image using Runway Gen-4 Turbo image-to-video API.
+    Returns path to downloaded MP4 clip.
+
+    Requires RUNWAY_API_KEY in environment.
+    Cost: ~$0.25 per 5-second clip (gen4_turbo).
     """
     try:
-        from animated_drawings import render
+        from runwayml import RunwayML
     except ImportError:
         raise ImportError(
-            "Meta AnimatedDrawings is not installed. Install it with:\n"
-            "  git clone https://github.com/facebookresearch/AnimatedDrawings.git /tmp/AnimatedDrawings\n"
-            "  cd /tmp/AnimatedDrawings && pip install -e ."
+            "runwayml is not installed. Install it with:\n"
+            "  pip3 install runwayml"
         )
 
-    motion = ACTION_TO_MOTION.get(action, "walks_in_place")
-    work_dir = Path(tempfile.mkdtemp())
+    api_key = os.environ.get("RUNWAY_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "RUNWAY_API_KEY not set. Add it to your .env file:\n"
+            "  RUNWAY_API_KEY=your_key_here"
+        )
 
-    try:
-        scene_cfg = work_dir / "scene_cfg.yaml"
-        scene_data = {
-            "ANIMATED_CHARACTERS": [{
-                "character_cfg": image_path,
-                "motion_cfg": motion,
-                "position": [0, 0],
-            }],
-            "EXPORT_VIDEO": {
-                "enabled": True,
-                "path": output_path,
-                "fps": 24,
-                "duration": duration_seconds,
-            }
-        }
-        scene_cfg.write_text(yaml.dump(scene_data))
-        render.start(str(scene_cfg))
-        return output_path
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+    client = RunwayML(api_key=api_key)
+
+    # Build prompt: motion instruction first (most weight), then scene context
+    if raw_prompt:
+        # description is already a fully hand-crafted prompt — use as-is
+        prompt = description
+    else:
+        base_motion = ACTION_TO_PROMPT.get(action, ACTION_TO_PROMPT["walk"])
+        if description:
+            short_desc = description[:100]
+            prompt = f"{base_motion} Scene: {short_desc}. Keep the illustrated art style unchanged, no photorealism."
+        else:
+            prompt = f"{base_motion} Keep the illustrated art style unchanged, no photorealism."
+
+    print(f"    Runway prompt: {prompt[:80]}...")
+
+    # Upload image as data URI
+    data_uri = _image_to_data_uri(image_path)
+
+    task = client.image_to_video.create(
+        model=RUNWAY_MODEL,
+        prompt_image=data_uri,
+        prompt_text=prompt,
+        ratio="1280:720",
+        duration=VIDEO_DURATION,
+    )
+
+    print(f"    Runway task submitted: {task.id} — waiting for render...")
+
+    # Poll until complete
+    while True:
+        time.sleep(8)
+        result = client.tasks.retrieve(task.id)
+        status = result.status
+        if status == "SUCCEEDED":
+            break
+        elif status in ("FAILED", "CANCELED"):
+            raise RuntimeError(f"Runway task {task.id} ended with status: {status}")
+        print(f"    Runway status: {status}...")
+
+    # Download the MP4
+    video_url = result.output[0]
+    print(f"    Downloading Runway output...")
+    urllib.request.urlretrieve(video_url, output_path)
+    print(f"    Saved: {Path(output_path).name}")
+    return output_path

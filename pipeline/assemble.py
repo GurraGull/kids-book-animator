@@ -115,23 +115,77 @@ def _image_with_subtitle(image_path: str, text: str, tmp_dir: str) -> str:
     return str(dst)
 
 
+def _subtitle_overlay_png(text: str, tmp_dir: str) -> str:
+    """Create a transparent PNG of just the subtitle bar — for overlaying on video."""
+    canvas = Image.new("RGBA", (FRAME_W, FRAME_H), (0, 0, 0, 0))
+    font = _get_font(FONT_SIZE_SUBTITLE)
+    w, h = canvas.size
+
+    dummy_draw = ImageDraw.Draw(canvas)
+    words = text.split()
+    lines = []
+    current = []
+    for word in words:
+        test_line = " ".join(current + [word])
+        bbox = dummy_draw.textbbox((0, 0), test_line, font=font)
+        if bbox[2] - bbox[0] > w * 0.8 and current:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+
+    line_height = FONT_SIZE_SUBTITLE + 10
+    pad = 18
+    total_text_h = line_height * len(lines)
+    bar_h = total_text_h + pad * 2
+    bar_top = int(h * SUBTITLE_Y_FRAC) - bar_h // 2
+
+    bar_draw = ImageDraw.Draw(canvas)
+    bar_draw.rectangle([(0, bar_top), (w, bar_top + bar_h)], fill=(0, 0, 0, 160))
+
+    draw = ImageDraw.Draw(canvas)
+    y_start = bar_top + pad
+    for i, line in enumerate(lines):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        text_w = bbox[2] - bbox[0]
+        x = (w - text_w) // 2
+        y = y_start + i * line_height
+        for dx, dy in [(3, 3), (-2, 2), (2, -2)]:
+            draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 220))
+        draw.text((x, y), line, font=font, fill=(255, 255, 255, 255))
+
+    dst = Path(tmp_dir) / "subtitle_overlay.png"
+    canvas.save(str(dst), "PNG")
+    return str(dst)
+
+
 def make_ken_burns_clip(image_path: str, audio_path: str, text: str, output_path: str) -> str:
     """Create a video clip: Ken Burns zoom on still image + narration audio + subtitle."""
-    duration = get_audio_duration(audio_path)
+    audio_duration = get_audio_duration(audio_path)
+    PAUSE = 1.2  # seconds of still image after narration ends, before next page
+    duration = audio_duration + PAUSE
 
     with tempfile.TemporaryDirectory() as tmp:
         sub_image = _image_with_subtitle(image_path, text, tmp)
         frames = int(duration * 24)
+        # Smooth Ken Burns: very gentle zoom-in, centered, minimal jitter
+        # scale to slightly larger than output, then zoompan with slow linear zoom
         vf = (
-            f"scale=2200:-1,"
-            f"zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f"scale={FRAME_W * 2}:{FRAME_H * 2}:flags=lanczos,"
+            f"zoompan=z='1.0+0.0003*on':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
             f":d={frames}:s={FRAME_W}x{FRAME_H}:fps=24"
         )
+        # Pad audio with silence so clip total duration = audio + pause
+        audio_in = ffmpeg.input(audio_path)
+        silence = ffmpeg.input("anullsrc=r=44100:cl=stereo", f="lavfi", t=PAUSE)
+        padded_audio = ffmpeg.filter([audio_in, silence], "concat", n=2, v=0, a=1)
         (
             ffmpeg
             .input(sub_image, loop=1, t=duration + 0.5, framerate=24)
             .output(
-                ffmpeg.input(audio_path),
+                padded_audio,
                 output_path,
                 vf=vf,
                 vcodec="libx264",
@@ -279,6 +333,45 @@ def concatenate_clips(clip_paths: list, music_path, output_path: str) -> str:
     return output_path
 
 
+def _make_runway_clip(runway_mp4: str, audio_path: str, text: str, output_path: str) -> str:
+    """
+    Combine a Runway-generated video with narration audio + subtitle overlay.
+    Loops the Runway video if it's shorter than the audio + pause.
+    """
+    PAUSE = 1.2
+    audio_dur = get_audio_duration(audio_path)
+    total_dur = audio_dur + PAUSE
+
+    # Build padded audio: narration + 1.2s silence
+    silence = ffmpeg.input("anullsrc=r=44100:cl=stereo", f="lavfi", t=PAUSE)
+    padded_audio = ffmpeg.filter([ffmpeg.input(audio_path), silence], "concat", n=2, v=0, a=1)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Create subtitle overlay PNG (transparent background, text bar at bottom)
+        sub_png = _subtitle_overlay_png(text, tmp)
+
+        # Runway video: loop + scale to 1920x1080
+        base_video = (
+            ffmpeg.input(runway_mp4, stream_loop=-1, t=total_dur)
+            .video
+            .filter("scale", FRAME_W, FRAME_H)
+        )
+        # Subtitle overlay: static PNG looped as video
+        sub_video = ffmpeg.input(sub_png, loop=1, t=total_dur, framerate=24).video
+
+        # Composite: Runway video underneath, subtitle PNG on top
+        composited = ffmpeg.filter([base_video, sub_video], "overlay", x=0, y=0)
+
+        (
+            ffmpeg
+            .output(composited, padded_audio, output_path,
+                    vcodec="libx264", acodec="aac", pix_fmt="yuv420p", t=total_dur)
+            .overwrite_output()
+            .run(quiet=True)
+        )
+    return output_path
+
+
 def assemble_book(
     book_dir: str,
     plan: BookPlan,
@@ -304,24 +397,13 @@ def assemble_book(
         zip(plan.pages, normalized_images, audio_paths, narration_lines)
     ):
         clip_out = str(clips_dir / f"{i+1:02d}_page.mp4")
-        if page.character and page.action:
-            from pipeline.character import remove_background, animate_character
-            duration = get_audio_duration(audio_path)
-            nobg_path = str(clips_dir / f"{i+1:02d}_nobg.png")
-            anim_path = str(clips_dir / f"{i+1:02d}_anim.mp4")
-            remove_background(img_path, nobg_path)
-            animate_character(nobg_path, page.action, duration, anim_path)
-            # Add subtitle to animated clip by overlaying the text image
-            with tempfile.TemporaryDirectory() as tmp:
-                sub_image = _image_with_subtitle(img_path, text, tmp)
-                (
-                    ffmpeg
-                    .input(anim_path)
-                    .output(ffmpeg.input(audio_path), clip_out,
-                            vcodec="libx264", acodec="aac", pix_fmt="yuv420p")
-                    .overwrite_output()
-                    .run(quiet=True)
-                )
+        runway_key = os.environ.get("RUNWAY_API_KEY")
+        if page.character and page.action and runway_key:
+            from pipeline.character import animate_with_runway
+            print(f"  Animating page {i+1} with Runway ({page.action})...")
+            raw_anim = str(clips_dir / f"{i+1:02d}_runway_raw.mp4")
+            animate_with_runway(img_path, page.action, page.description or "", raw_anim)
+            _make_runway_clip(raw_anim, audio_path, text, clip_out)
         else:
             make_ken_burns_clip(img_path, audio_path, text, clip_out)
         clip_paths.append(clip_out)

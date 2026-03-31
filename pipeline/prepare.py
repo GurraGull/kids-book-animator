@@ -1,20 +1,30 @@
 from pathlib import Path
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 
 TARGET_SIZE = (1920, 1080)
 
 
 def normalize_image(src_path: str, dst_path: str) -> None:
-    """Resize and letterbox an image to 1920x1080, save as JPEG."""
+    """Resize and letterbox an image to 1920x1080, save as JPEG.
+    Uses a blurred/zoomed version of the image itself as background instead of black bars.
+    """
     img = Image.open(src_path).convert("RGB")
     img = ImageOps.exif_transpose(img)  # fix rotation from phone cameras
+
+    # Create blurred background: scale image to fill full frame, then blur heavily
+    bg = img.copy()
+    bg = ImageOps.fit(bg, TARGET_SIZE, Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=12))
+    # Darken slightly so the foreground page pops
+    from PIL import ImageEnhance
+    bg = ImageEnhance.Brightness(bg).enhance(0.70)
+
+    # Foreground: fit page within frame preserving aspect ratio
     img.thumbnail(TARGET_SIZE, Image.LANCZOS)
-    # Letterbox: paste onto black 1920x1080 canvas
-    canvas = Image.new("RGB", TARGET_SIZE, (0, 0, 0))
     x = (TARGET_SIZE[0] - img.width) // 2
     y = (TARGET_SIZE[1] - img.height) // 2
-    canvas.paste(img, (x, y))
-    canvas.save(dst_path, "JPEG", quality=95)
+    bg.paste(img, (x, y))
+    bg.save(dst_path, "JPEG", quality=95)
 
 
 def extract_pdf_pages(pdf_path: str, output_dir: str) -> list:
